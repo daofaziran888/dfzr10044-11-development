@@ -67,21 +67,147 @@ class WatermarkRecord:
     last_advanced_at: float
 
 
+# ----------------------------- 结构版本 -----------------------------
+
+@dataclass
+class ColumnSpec:
+    """结构版本中的列声明：名称、类型、量纲单位与可空性。
+
+    unit 用于跨版本量纲换算（元 / 分）；factor 表示该列相对基准单位的倍率。
+    """
+    name: str
+    type: str
+    nullable: bool = True
+    unit: str = ""
+    factor: float = 1.0
+
+
+@dataclass
+class SchemaVersion:
+    """结构版本：一张湖表某一版完整列结构，以及与父版本之间的字段转换映射。
+
+    conversions 的键为新版本列名，值描述来源列与换算方式，例如：
+    {"amount_cents": {"source": "amount", "expr": "scale", "factor": 100}}
+    结构版本按 (湖表, 版本号) 唯一；另一张湖表的同名版本必须被拒绝。
+    """
+    version_id: str
+    lake_table: str
+    parent_version_id: str | None
+    columns: list[ColumnSpec]
+    conversions: dict[str, dict[str, Any]]
+    status: str  # draft | active | superseded
+    reason: str
+    created_at: float
+
+    def column(self, name: str) -> ColumnSpec | None:
+        for col in self.columns:
+            if col.name == name:
+                return col
+        return None
+
+
+# ----------------------------- 规则版本 -----------------------------
+
+@dataclass
+class RuleVersion:
+    """规则版本：某次发布时点上完整、不可变的质量规则快照。
+
+    阈值口径随版本冻结：校验时读取的是快照里的阈值，而不是规则模块的当前值。
+    """
+    rule_version_id: str
+    lake_table: str
+    schema_version_id: str
+    rules: list[dict[str, Any]]
+    status: str  # active | superseded
+    created_at: float
+
+
 # ----------------------------- 批次数据 -----------------------------
 
 @dataclass
 class BatchRecord:
-    """入湖批次：一次入湖操作导出的一组数据行。"""
+    """入湖批次：一次入湖操作导出的一组数据行。
+
+    schema_version_id 保留批次采集当时读到的结构版本，
+    之后任何复算都必须能从批次查回这套结构与原始输入。
+    """
     batch_id: str
     lake_table: str
     source_system: str
-    rows: list[dict[str, Any]]  # 实际数据行
+    rows: list[dict[str, Any]]  # 实际数据行（原始输入，永不被转换覆盖）
     row_count: int
     window_start: str
     window_end: str
     checksum: str
     snapshot_id: str | None  # 落湖后分配的 snap
     status: str  # pending | ingesting | ingested | failed
+    created_at: float
+    schema_version_id: str | None = None
+    rule_version_id: str | None = None
+
+
+# ----------------------------- 质量评估会话 -----------------------------
+
+@dataclass
+class RowEvaluation:
+    """单行评估明细：原输入、按目标结构转换后的输入与判定结论。"""
+    row_index: int
+    row_key: str
+    raw_input: dict[str, Any]
+    converted_input: dict[str, Any]
+    verdict: str  # passed | violated
+    hit_rules: list[str]
+    evaluated_values: dict[str, Any]  # 各规则实际读到的值（量纲转换后）
+
+
+@dataclass
+class EvaluationSession:
+    """一次完整的按结构版本校验：冻结所用结构/规则版本与逐行复算轨迹。"""
+    evaluation_id: str
+    batch_id: str
+    lake_table: str
+    schema_version_id: str
+    rule_version_id: str
+    origin: str  # initial | recheck | retry
+    source_evaluation_id: str | None
+    status: str  # validating | confirmed
+    row_evaluations: list[RowEvaluation]
+    created_at: float
+    confirmed_at: float | None = None
+
+
+# ----------------------------- 隔离记录 -----------------------------
+
+@dataclass
+class QuarantineRecord:
+    """行级隔离记录：保留初次判定版本、原输入与每次复检/回炉轨迹。"""
+    quarantine_id: str
+    batch_id: str
+    lake_table: str
+    row_key: str
+    original_input: dict[str, Any]
+    corrected_input: dict[str, Any] | None
+    rule_id: str
+    rule_name: str
+    schema_version_id: str
+    rule_version_id: str
+    initial_evaluation_id: str
+    status: str  # isolated | released | archived
+    created_at: float
+    evaluations: list[dict[str, Any]] = field(default_factory=list)
+
+
+# ----------------------------- 幂等落湖台账 -----------------------------
+
+@dataclass
+class LakeLedgerEntry:
+    """有效数据落湖台账：同一行主键在同一湖表只允许出现一次。"""
+    row_key: str
+    lake_table: str
+    batch_id: str
+    evaluation_id: str
+    schema_version_id: str
+    payload: dict[str, Any]
     created_at: float
 
 
@@ -117,12 +243,16 @@ class WriteLock:
 class LakeStore:
     """湖表存储引擎主类。
 
-    管理三大维度：
+    管理维度：
     - files: 分区文件注册表
     - snapshots: 快照链
     - watermarks: 水位
-    - batches: 批次数据
-    - quarantine: 隔离区数据
+    - batches: 批次数据（保留采集时的结构版本）
+    - schema_versions: 结构版本目录（含量纲与跨版本转换）
+    - rule_versions: 不可变规则版本快照
+    - evaluations: 按结构版本的校验/复算会话
+    - quarantine: 行级隔离区（保留初次判定版本与原输入）
+    - ledger: 有效数据幂等落湖台账
     - write_lock: 并发提交的控制锁
     """
 
@@ -139,8 +269,23 @@ class LakeStore:
         # 批次数据：batch_id -> BatchRecord
         self._batches: dict[str, BatchRecord] = {}
 
-        # 隔离区：batch_id -> list[dict]（被拦截的数据行）
+        # 结构版本：(lake_table, version_id) -> SchemaVersion
+        self._schema_versions: dict[tuple[str, str], SchemaVersion] = {}
+
+        # 规则版本：rule_version_id -> RuleVersion
+        self._rule_versions: dict[str, RuleVersion] = {}
+
+        # 质量评估会话：evaluation_id -> EvaluationSession
+        self._evaluations: dict[str, EvaluationSession] = {}
+
+        # 行级隔离区：quarantine_id -> QuarantineRecord
+        self._quarantine_records: dict[str, QuarantineRecord] = {}
+
+        # 旧接口兼容存储：batch_id -> list[dict]（quarantine_rows 仍可使用）
         self._quarantine: dict[str, list[dict[str, Any]]] = {}
+
+        # 幂等落湖台账：(lake_table, row_key) -> LakeLedgerEntry
+        self._ledger: dict[tuple[str, str], LakeLedgerEntry] = {}
 
         # 写锁
         self._write_lock = WriteLock()
@@ -301,6 +446,7 @@ class LakeStore:
     def store_batch(
         self, batch_id: str, lake_table: str, source_system: str,
         rows: list[dict[str, Any]], window_start: str, window_end: str,
+        schema_version_id: str | None = None,
     ) -> BatchRecord:
         checksum = hashlib.md5(
             str(sorted([str(r) for r in rows])).encode()
@@ -317,6 +463,7 @@ class LakeStore:
             snapshot_id=None,
             status="pending",
             created_at=time.time(),
+            schema_version_id=schema_version_id,
         )
         self._batches[batch_id] = br
         return br
@@ -327,6 +474,18 @@ class LakeStore:
     def list_batches(self, lake_table: str) -> list[BatchRecord]:
         return [b for b in self._batches.values() if b.lake_table == lake_table]
 
+    def bind_batch_versions(
+        self, batch_id: str, schema_version_id: str, rule_version_id: str | None = None
+    ) -> BatchRecord | None:
+        """把批次当时读到的结构版本（及规则版本）固定到批次记录上。"""
+        br = self._batches.get(batch_id)
+        if br is None:
+            return None
+        br.schema_version_id = schema_version_id
+        if rule_version_id is not None:
+            br.rule_version_id = rule_version_id
+        return br
+
     def update_batch_status(self, batch_id: str, status: str, snapshot_id: str | None = None) -> BatchRecord | None:
         br = self._batches.get(batch_id)
         if br is None:
@@ -336,7 +495,283 @@ class LakeStore:
             br.snapshot_id = snapshot_id
         return br
 
-    # ---- 隔离区 ----
+    # ---- 结构版本目录 ----
+
+    def register_schema_version(
+        self,
+        version_id: str,
+        lake_table: str,
+        columns: list[ColumnSpec],
+        *,
+        parent_version_id: str | None = None,
+        conversions: dict[str, dict[str, Any]] | None = None,
+        reason: str = "",
+    ) -> SchemaVersion:
+        """登记一个结构版本。
+
+        版本号在全局范围唯一：另一张湖表登记同名版本必须拒绝，
+        避免隔离复检时错拿别的湖表的同名结构。
+        """
+        for (other_table, other_id), existing in self._schema_versions.items():
+            if other_id == version_id and other_table != lake_table:
+                raise ValueError(
+                    f"结构版本号 {version_id} 已被湖表 {other_table} 占用，"
+                    f"湖表 {lake_table} 不得登记同名版本"
+                )
+        key = (lake_table, version_id)
+        if key in self._schema_versions:
+            raise ValueError(f"湖表 {lake_table} 已存在结构版本 {version_id}")
+        sv = SchemaVersion(
+            version_id=version_id,
+            lake_table=lake_table,
+            parent_version_id=parent_version_id,
+            columns=list(columns),
+            conversions=dict(conversions or {}),
+            status="draft",
+            reason=reason,
+            created_at=time.time(),
+        )
+        self._schema_versions[key] = sv
+        return sv
+
+    def get_schema_version(self, lake_table: str, version_id: str) -> SchemaVersion | None:
+        return self._schema_versions.get((lake_table, version_id))
+
+    def list_schema_versions(self, lake_table: str | None = None) -> list[SchemaVersion]:
+        versions = list(self._schema_versions.values())
+        if lake_table is not None:
+            versions = [v for v in versions if v.lake_table == lake_table]
+        return sorted(versions, key=lambda v: v.created_at)
+
+    def get_active_schema_version(self, lake_table: str) -> SchemaVersion | None:
+        active = [
+            v for v in self._schema_versions.values()
+            if v.lake_table == lake_table and v.status == "active"
+        ]
+        return active[-1] if active else None
+
+    def has_inflight_evaluation(self, lake_table: str) -> bool:
+        """该湖表是否存在仍在 validating（在途校验、未确认）的评估会话。"""
+        return any(
+            ev.lake_table == lake_table and ev.status == "validating"
+            for ev in self._evaluations.values()
+        )
+
+    def list_inflight_evaluations(self, lake_table: str) -> list[EvaluationSession]:
+        return [
+            ev for ev in self._evaluations.values()
+            if ev.lake_table == lake_table and ev.status == "validating"
+        ]
+
+    def activate_schema_version(self, version_id: str, lake_table: str) -> SchemaVersion:
+        """生效一个结构版本；与在途批次校验冲突时拒绝发布。
+
+        旧的生效版本转为 superseded，新版本置为 active。
+        """
+        sv = self._schema_versions.get((lake_table, version_id))
+        if sv is None:
+            raise KeyError(f"湖表 {lake_table} 不存在结构版本 {version_id}")
+        inflight = self.list_inflight_evaluations(lake_table)
+        if inflight:
+            ids = ", ".join(ev.evaluation_id for ev in inflight)
+            raise RuntimeError(
+                f"结构版本 {version_id} 发布冲突：湖表 {lake_table} 存在 "
+                f"{len(inflight)} 个在途校验会话（{ids}）尚未确认"
+            )
+        for existing in self._schema_versions.values():
+            if existing.lake_table == lake_table and existing.status == "active":
+                existing.status = "superseded"
+        sv.status = "active"
+        return sv
+
+    # ---- 规则版本（不可变快照） ----
+
+    def create_rule_version(
+        self,
+        rule_version_id: str,
+        lake_table: str,
+        schema_version_id: str,
+        rules: list[dict[str, Any]],
+    ) -> RuleVersion:
+        """发布一版不可变规则快照；与在途校验冲突时拒绝。"""
+        if self.get_schema_version(lake_table, schema_version_id) is None:
+            raise KeyError(
+                f"规则版本必须绑定湖表 {lake_table} 已登记的结构版本，"
+                f"未知结构版本 {schema_version_id}"
+            )
+        if rule_version_id in self._rule_versions:
+            raise ValueError(f"规则版本 {rule_version_id} 已存在")
+        inflight = self.list_inflight_evaluations(lake_table)
+        if inflight:
+            ids = ", ".join(ev.evaluation_id for ev in inflight)
+            raise RuntimeError(
+                f"规则版本 {rule_version_id} 发布冲突：湖表 {lake_table} 存在 "
+                f"{len(inflight)} 个在途校验会话（{ids}）尚未确认"
+            )
+        rv = RuleVersion(
+            rule_version_id=rule_version_id,
+            lake_table=lake_table,
+            schema_version_id=schema_version_id,
+            rules=copy.deepcopy(rules),
+            status="active",
+            created_at=time.time(),
+        )
+        for existing in self._rule_versions.values():
+            if existing.lake_table == lake_table and existing.status == "active":
+                existing.status = "superseded"
+        self._rule_versions[rule_version_id] = rv
+        return rv
+
+    def get_rule_version(self, rule_version_id: str) -> RuleVersion | None:
+        return self._rule_versions.get(rule_version_id)
+
+    def list_rule_versions(self, lake_table: str | None = None) -> list[RuleVersion]:
+        versions = list(self._rule_versions.values())
+        if lake_table is not None:
+            versions = [v for v in versions if v.lake_table == lake_table]
+        return sorted(versions, key=lambda v: v.created_at)
+
+    def get_active_rule_version(self, lake_table: str) -> RuleVersion | None:
+        active = [
+            v for v in self._rule_versions.values()
+            if v.lake_table == lake_table and v.status == "active"
+        ]
+        return active[-1] if active else None
+
+    # ---- 质量评估会话 ----
+
+    def save_evaluation(self, session: EvaluationSession) -> EvaluationSession:
+        self._evaluations[session.evaluation_id] = session
+        return session
+
+    def get_evaluation(self, evaluation_id: str) -> EvaluationSession | None:
+        return self._evaluations.get(evaluation_id)
+
+    def list_evaluations(
+        self, lake_table: str | None = None, batch_id: str | None = None
+    ) -> list[EvaluationSession]:
+        sessions = list(self._evaluations.values())
+        if lake_table is not None:
+            sessions = [s for s in sessions if s.lake_table == lake_table]
+        if batch_id is not None:
+            sessions = [s for s in sessions if s.batch_id == batch_id]
+        return sorted(sessions, key=lambda s: s.created_at)
+
+    def mark_evaluation_confirmed(self, evaluation_id: str) -> EvaluationSession | None:
+        session = self._evaluations.get(evaluation_id)
+        if session is None:
+            return None
+        session.status = "confirmed"
+        session.confirmed_at = time.time()
+        return session
+
+    # ---- 行级隔离区 ----
+
+    def add_quarantine_record(self, record: QuarantineRecord) -> QuarantineRecord:
+        self._quarantine_records[record.quarantine_id] = record
+        return record
+
+    def get_quarantine_record(self, quarantine_id: str) -> QuarantineRecord | None:
+        return self._quarantine_records.get(quarantine_id)
+
+    def find_quarantine_record(
+        self, batch_id: str, row_key: str
+    ) -> QuarantineRecord | None:
+        for record in self._quarantine_records.values():
+            if record.batch_id == batch_id and record.row_key == row_key:
+                return record
+        return None
+
+    def list_quarantine_records(
+        self,
+        lake_table: str | None = None,
+        batch_id: str | None = None,
+        status: str | None = None,
+    ) -> list[QuarantineRecord]:
+        records = list(self._quarantine_records.values())
+        if lake_table is not None:
+            records = [r for r in records if r.lake_table == lake_table]
+        if batch_id is not None:
+            records = [r for r in records if r.batch_id == batch_id]
+        if status is not None:
+            records = [r for r in records if r.status == status]
+        return sorted(records, key=lambda r: r.created_at)
+
+    def append_quarantine_evaluation(
+        self, quarantine_id: str, evaluation: dict[str, Any]
+    ) -> QuarantineRecord | None:
+        record = self._quarantine_records.get(quarantine_id)
+        if record is None:
+            return None
+        record.evaluations.append(copy.deepcopy(evaluation))
+        return record
+
+    def update_quarantine_status(
+        self, quarantine_id: str, status: str,
+        corrected_input: dict[str, Any] | None = None,
+    ) -> QuarantineRecord | None:
+        record = self._quarantine_records.get(quarantine_id)
+        if record is None:
+            return None
+        record.status = status
+        if corrected_input is not None:
+            record.corrected_input = copy.deepcopy(corrected_input)
+        return record
+
+    # ---- 幂等落湖台账 ----
+
+    def ledger_contains(self, lake_table: str, row_key: str) -> bool:
+        return (lake_table, row_key) in self._ledger
+
+    def ledger_get(self, lake_table: str, row_key: str) -> LakeLedgerEntry | None:
+        return self._ledger.get((lake_table, row_key))
+
+    def ledger_add(
+        self,
+        lake_table: str,
+        row_key: str,
+        batch_id: str,
+        evaluation_id: str,
+        schema_version_id: str,
+        payload: dict[str, Any],
+    ) -> LakeLedgerEntry:
+        """台账写入：同一 (湖表, 行主键) 已存在时直接返回旧记录，保证只落一次。"""
+        existing = self._ledger.get((lake_table, row_key))
+        if existing is not None:
+            return existing
+        entry = LakeLedgerEntry(
+            row_key=row_key,
+            lake_table=lake_table,
+            batch_id=batch_id,
+            evaluation_id=evaluation_id,
+            schema_version_id=schema_version_id,
+            payload=copy.deepcopy(payload),
+            created_at=time.time(),
+        )
+        self._ledger[(lake_table, row_key)] = entry
+        return entry
+
+    def ledger_list(self, lake_table: str | None = None) -> list[LakeLedgerEntry]:
+        entries = list(self._ledger.values())
+        if lake_table is not None:
+            entries = [e for e in entries if e.lake_table == lake_table]
+        return sorted(entries, key=lambda e: e.created_at)
+
+    def reset(self) -> None:
+        """清空全部运行态数据（测试隔离用）。"""
+        self._files.clear()
+        self._snapshots.clear()
+        self._watermarks.clear()
+        self._batches.clear()
+        self._schema_versions.clear()
+        self._rule_versions.clear()
+        self._evaluations.clear()
+        self._quarantine_records.clear()
+        self._quarantine.clear()
+        self._ledger.clear()
+        self._merge_checkpoints.clear()
+
+    # ---- 隔离区（旧接口，保持兼容） ----
 
     def quarantine_rows(
         self, batch_id: str, rule_id: str, rule_name: str,

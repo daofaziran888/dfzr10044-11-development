@@ -22,8 +22,13 @@ class IngestBatchService(BaseModuleService):
 
     def ingest_batch(self, lake_table: str, source_system: str,
                      rows: list[dict[str, Any]], window_start: str,
-                     window_end: str) -> dict[str, Any]:
-        """接收入湖批次数据：去重、存储、并与快照绑定。"""
+                     window_end: str,
+                     schema_version_id: str | None = None) -> dict[str, Any]:
+        """接收入湖批次数据：去重、存储、并与快照绑定。
+
+        schema_version_id 固定批次采集当时读到的结构版本，后续校验/复检/回炉
+        都能从批次查回同一套完整结构。
+        """
         batch_id = f"batch-{lake_table}-{uuid.uuid4().hex[:6]}"
         # 先去重再存储
         seen = set()
@@ -34,7 +39,8 @@ class IngestBatchService(BaseModuleService):
                 seen.add(key)
                 deduped.append(r)
         br = lake_store.store_batch(batch_id, lake_table, source_system,
-                                    deduped, window_start, window_end)
+                                    deduped, window_start, window_end,
+                                    schema_version_id=schema_version_id)
         lake_store.update_batch_status(batch_id, "ingesting")
         return {
             "batch_id": batch_id,
@@ -42,6 +48,7 @@ class IngestBatchService(BaseModuleService):
             "row_count": len(deduped),
             "duplicates_removed": len(rows) - len(deduped),
             "checksum": br.checksum,
+            "schema_version_id": br.schema_version_id,
             "window": f"{window_start} ~ {window_end}",
         }
 
